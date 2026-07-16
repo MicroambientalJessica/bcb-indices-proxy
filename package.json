@@ -1,0 +1,10 @@
+{
+  "name": "bcb-indices-proxy",
+  "version": "1.0.0",
+  "description": "Proxy serverless para buscar indices do Banco Central (SGS)",
+  "main": "api/bcb-indices.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
