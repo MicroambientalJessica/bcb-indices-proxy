@@ -1,41 +1,42 @@
 /**
- * Proxy Vercel v2 - API SGS do BCB (mais confiavel)
- * Busca serie historica diretamente da API do BCB
+ * Proxy Vercel v3 - API SGS do BCB
+ * Usa apenas o endpoint oficial e confiavel api.bcb.gov.br
+ * IPCA: serie 13522 (ja acumulada em 12 meses)
+ * IGP-M e INPC: calculados a partir das series mensais (189 e 188),
+ *   compondo os ultimos 12 meses, pois nao ha series 'acumulado 12 meses'
+ *   confiavel e atualizada para esses indices no SGS.
+ * IPC: serie 4391 (variacao mensal)
  */
 
 const https = require('https');
-const http = require('http');
 
-// Series IDs do BCB
 const SERIES = {
-  ipca: '13522',      // IPCA - acumulado 12 meses
-  igp_m: '11255',     // IGP-M - acumulado 12 meses
-  inpc: '10846',      // INPC - acumulado 12 meses
-  ipc: '4391'         // IPC - variacao mensal
+  ipca: { codigo: '13522', tipo: 'direto' },
+  igp_m: { codigo: '189', tipo: 'acumulado12' },
+  inpc: { codigo: '188', tipo: 'acumulado12' },
+  ipc: { codigo: '4391', tipo: 'direto' }
 };
 
-async function fetchFromBCB(url) {
+function fetchJSON(url) {
   return new Promise((resolve, reject) => {
-    const protocol = url.startsWith('https') ? https : http;
-
     const options = {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'pt-BR,pt;q=0.9'
+        'Accept': 'application/json'
       },
-      timeout: 10000
+      timeout: 8000
     };
 
-    const req = protocol.get(url, options, (res) => {
+    const req = https.get(url, options, (res) => {
       let data = '';
-
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
+      res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         if (res.statusCode === 200) {
-          resolve(data);
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(new Error(`Resposta invalida do BCB: ${e.message}`));
+          }
         } else {
           reject(new Error(`Status ${res.statusCode}`));
         }
@@ -53,85 +54,63 @@ async function fetchFromBCB(url) {
   });
 }
 
-async function buscarSerieHistorica(serieId) {
-  /**
-   * Busca dados de uma serie do BCB
-   * Tenta 3 endpoints diferentes para redundancia
-   */
-
-  const urls = [
-    `https://www.bcb.gov.br/api/dados/v1/serie_temporal/${serieId}/dados?formato=json`,
-    `https://www3.bcb.gov.br/wps/wcm/connect/${serieId}/dados?formato=json`,
-    `https://api.bcb.gov.br/dados/serie/bcdata.sgs.${serieId}/dados?formato=json`
-  ];
-
-  let ultimoErro = null;
-
-  for (const url of urls) {
-    try {
-      const response = await fetchFromBCB(url);
-      const dados = JSON.parse(response);
-
-      // Formato: [{ data: "DD/MM/YYYY", valor: "4.50" }, ...]
-      if (Array.isArray(dados)) {
-        for (let i = dados.length - 1; i >= 0; i--) {
-          const item = dados[i];
-          if (item.valor && item.valor !== '' && item.valor !== '0') {
-            return {
-              valor: parseFloat(item.valor.replace(',', '.')),
-              data: item.data,
-              fonte: 'BCB SGS'
-            };
-          }
-        }
-      } else if (dados.dados && Array.isArray(dados.dados)) {
-        // Formato alternativo
-        for (let i = dados.dados.length - 1; i >= 0; i--) {
-          const item = dados.dados[i];
-          if (item.valor && item.valor !== '' && item.valor !== '0') {
-            return {
-              valor: parseFloat(item.valor.replace(',', '.')),
-              data: item.data,
-              fonte: 'BCB SGS'
-            };
-          }
-        }
-      }
-    } catch (e) {
-      ultimoErro = e.message;
-      continue; // Tenta proxima URL
-    }
+async function buscarUltimos(codigo, quantidade) {
+  const url = `https://api.bcb.gov.br/dados/serie/bcdata.sgs.${codigo}/dados/ultimos/${quantidade}?formato=json`;
+  const dados = await fetchJSON(url);
+  if (!Array.isArray(dados) || dados.length === 0) {
+    throw new Error(`Sem dados para a serie ${codigo}`);
   }
+  return dados;
+}
 
-  throw new Error(`Nao foi possivel buscar serie ${serieId}. Ultimo erro: ${ultimoErro}`);
+async function valorDireto(codigo) {
+  const dados = await buscarUltimos(codigo, 1);
+  const item = dados[dados.length - 1];
+  return {
+    valor: parseFloat(String(item.valor).replace(',', '.')),
+    data: item.data
+  };
+}
+
+async function valorAcumulado12Meses(codigo) {
+  const dados = await buscarUltimos(codigo, 12);
+  let fator = 1;
+  for (const item of dados) {
+    const v = parseFloat(String(item.valor).replace(',', '.'));
+    fator *= (1 + v / 100);
+  }
+  const acumulado = (fator - 1) * 100;
+  return {
+    valor: Math.round(acumulado * 100) / 100,
+    data: dados[dados.length - 1].data
+  };
+}
+
+async function buscarIndice(config) {
+  return config.tipo === 'acumulado12'
+    ? valorAcumulado12Meses(config.codigo)
+    : valorDireto(config.codigo);
 }
 
 async function obterTodosIndices() {
-  /**
-   * Busca todos os indices em paralelo
-   */
-  const promessas = [];
+  const chaves = Object.keys(SERIES);
+  const resultados = await Promise.all(
+    chaves.map((chave) =>
+      buscarIndice(SERIES[chave])
+        .then((resultado) => ({ chave, resultado }))
+        .catch((erro) => ({ chave, erro: erro.message }))
+    )
+  );
 
-  for (const [key, id] of Object.entries(SERIES)) {
-    promessas.push(
-      buscarSerieHistorica(id)
-        .then(resultado => ({ [key]: resultado }))
-        .catch(erro => ({ [key]: { erro: erro.message, valor: null } }))
-    );
-  }
-
-  const resultados = await Promise.all(promessas);
   const indices = {};
-
-  resultados.forEach(resultado => {
-    Object.assign(indices, resultado);
+  resultados.forEach(({ chave, resultado, erro }) => {
+    indices[chave] = resultado || { valor: null, data: null, erro };
   });
 
   return indices;
 }
 
 module.exports = async (req, res) => {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -150,11 +129,8 @@ module.exports = async (req, res) => {
   }
 
   try {
-    console.log('Buscando indices do BCB...');
-
     const indices = await obterTodosIndices();
 
-    // Formatar resposta
     const resposta = {
       success: true,
       timestamp: new Date().toISOString(),
@@ -172,25 +148,25 @@ module.exports = async (req, res) => {
         ipc_data: indices.ipc?.data ?? null
       },
       info: {
-        proxy: 'Vercel Serverless v2',
-        fonte: 'BCB API SGS',
+        proxy: 'Vercel Serverless v3',
+        fonte: 'BCB API SGS (api.bcb.gov.br)',
         documentacao: 'https://www.bcb.gov.br/api/',
         series: {
-          ipca: '13522 (acumulado 12 meses)',
-          igp_m: '11255 (acumulado 12 meses)',
-          inpc: '10846 (acumulado 12 meses)',
+          ipca: '13522 (acumulado 12 meses, direto do SGS)',
+          igp_m: '189 (variacao mensal, acumulado calculado sobre os ultimos 12 meses)',
+          inpc: '188 (variacao mensal, acumulado calculado sobre os ultimos 12 meses)',
           ipc: '4391 (variacao mensal)'
         }
       }
     };
 
-    // Verificar se conseguiu obter pelo menos alguns indices
-    const temDados = resposta.data.ipca || resposta.data.igp_m || resposta.data.inpc || resposta.data.ipc;
+    const temDados = resposta.data.ipca !== null || resposta.data.igp_m !== null ||
+      resposta.data.inpc !== null || resposta.data.ipc !== null;
 
     if (!temDados) {
       return res.status(503).json({
         success: false,
-        error: 'BCB APIs indisponiveis no momento',
+        error: 'BCB API indisponivel no momento',
         timestamp: new Date().toISOString(),
         hint: 'Tente novamente em alguns minutos'
       });
@@ -198,7 +174,6 @@ module.exports = async (req, res) => {
 
     res.status(200).json(resposta);
   } catch (error) {
-    console.error('Erro geral:', error.message);
     res.status(500).json({
       success: false,
       error: error.message,
